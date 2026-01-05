@@ -1,69 +1,88 @@
-import requests
 import pandas as pd
 from datetime import datetime
 import os
+import json
 import time
 from playwright.sync_api import sync_playwright
 
-# === 核心修改：使用多个镜像源轮询 ===
-# 如果第一个挂了，自动尝试第二个
+# === 增强版配置 ===
+# 我们保留官方源，因为用浏览器模拟访问时，官方源通常不会拦截
 RSSHUB_DOMAINS = [
-    "https://rsshub.app",                 # 官方节点（容易被墙）
-    "https://rsshub.rssforever.com",      # 备用节点1
-    "https://rsshub.ktachibana.party",    # 备用节点2
-    "https://rss.fatpandac.com"           # 备用节点3
+    "https://rsshub.app",
+    "https://rsshub.feedly.cn",
+    "https://rsshub.pseudoyu.com",
+    "https://rsshub.mormm.com"
 ]
 
 ROUTES = {
-    "编辑推荐": "/xiaoyuzhou/editor_choice",
-    "热门榜": "/xiaoyuzhou/ranking/hot",
-    "锋芒榜": "/xiaoyuzhou/ranking/sharp",
-    "新星榜": "/xiaoyuzhou/ranking/new"
+    "编辑推荐": "/xiaoyuzhou/editor_choice.json",
+    "热门榜": "/xiaoyuzhou/ranking/hot.json",
+    "锋芒榜": "/xiaoyuzhou/ranking/sharp.json",
+    "新星榜": "/xiaoyuzhou/ranking/new.json"
 }
 
 def get_today_date():
     return datetime.now().strftime("%Y-%m-%d")
 
-# 尝试从不同的源获取数据
-def fetch_data_with_retry(route):
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-    
+# === 核心升级：用浏览器去“看”数据，而不是用脚本“抓” ===
+def fetch_data_via_browser(browser, route):
     for domain in RSSHUB_DOMAINS:
-        url = f"{domain}{route}.json"
-        print(f"正在尝试接口: {url} ...")
+        url = f"{domain}{route}"
+        print(f"🕵️ 正在伪装访问: {url} ...")
+        
+        page = browser.new_page()
         try:
-            resp = requests.get(url, headers=headers, timeout=10)
-            if resp.status_code == 200:
-                print("✅ 获取成功！")
-                return resp.json()
-            else:
-                print(f"❌ 失败 (状态码: {resp.status_code})")
-        except Exception as e:
-            print(f"❌ 连接超时或错误: {e}")
+            # 访问页面，等待3秒让数据加载
+            page.goto(url, timeout=30000)
+            # RSSHub 返回的是纯文本 JSON，我们直接提取页面里的文字
+            # 浏览器会自动把 JSON 放在 pre 标签或者 body 里
+            content = page.inner_text("body")
             
-    print("⚠️ 所有线路都失败了")
+            # 尝试解析 JSON
+            data = json.loads(content)
+            
+            # 检查数据是否有效
+            if 'items' in data:
+                print("✅ 成功获取数据！")
+                page.close()
+                return data
+            else:
+                print("❌ 数据格式不对，尝试下一个...")
+                
+        except Exception as e:
+            print(f"❌ 访问失败: {e}")
+        
+        page.close()
+        
+    print("⚠️ 所有线路均失败")
     return None
 
-def fetch_all_data():
+def process_data():
     all_data = []
-    print("🚀 开始多线路抓取数据...")
+    print("🚀 启动浏览器引擎...")
     
-    for category, route in ROUTES.items():
-        data = fetch_data_with_retry(route)
+    with sync_playwright() as p:
+        # 启动一个无头浏览器 (Headless Chrome)
+        browser = p.chromium.launch(headless=True)
         
-        if data:
-            items = data.get('items', [])
-            for index, item in enumerate(items[:10]): 
-                all_data.append({
-                    "日期": get_today_date(),
-                    "榜单类型": category,
-                    "排名": index + 1,
-                    "播客标题": item.get('title', '无标题'),
-                    "作者": item.get('author', {}).get('name', '未知'),
-                    "链接": item.get('url', '')
-                })
-        else:
-            print(f"⚠️ 警告：无法获取 [{category}] 的数据")
+        for category, route in ROUTES.items():
+            data = fetch_data_via_browser(browser, route)
+            
+            if data:
+                items = data.get('items', [])
+                for index, item in enumerate(items[:10]): 
+                    all_data.append({
+                        "日期": get_today_date(),
+                        "榜单类型": category,
+                        "排名": index + 1,
+                        "播客标题": item.get('title', '无标题'),
+                        "作者": item.get('author', {}).get('name', '未知'),
+                        "链接": item.get('url', '')
+                    })
+            # 稍微休息一下，防止访问太快被发现
+            time.sleep(2)
+            
+        browser.close()
 
     return pd.DataFrame(all_data)
 
@@ -150,12 +169,15 @@ def capture_homepage():
             browser.close()
 
 if __name__ == "__main__":
-    df = fetch_all_data()
-    
-    if not df.empty:
-        save_csv(df)
-        generate_chart_screenshot(df)
-        capture_homepage()
-    else:
-        # 强制报错，让 GitHub Action 变红，提示用户出错了
-        raise Exception("❌ 所有线路均无法获取数据，请检查 RSSHub 状态！")
+    try:
+        df = process_data()
+        if not df.empty:
+            save_csv(df)
+            generate_chart_screenshot(df)
+            capture_homepage()
+        else:
+            raise Exception("❌ 所有线路均无法获取数据！")
+    except Exception as e:
+        print(f"Fatal Error: {e}")
+        # 这里一定要抛出异常，让 GitHub Action 变红
+        raise e
